@@ -33,6 +33,19 @@ struct FeedbackData: Codable {
     }
 }
 
+// API Response Models
+struct APIResponse: Decodable {
+    let success: Bool
+    let responses: APIResponses
+}
+
+struct APIResponses: Decodable {
+    let gpt: String
+    let claude: String
+    let gemini: String
+    let moderator: String
+}
+
 enum ModeratorStyle: String, CaseIterable {
     case quickSummary = "Quick Summary"
     case bestAnswer = "Best Answer"
@@ -63,11 +76,6 @@ enum ModeratorStyle: String, CaseIterable {
 }
 
 // MARK: - ViewModel
-struct ChatMessageDTO: Decodable {
-    let role: String
-    let text: String
-}
-
 final class ChatVM: ObservableObject {
     @Published var messages: [ChatMessage] = []
     @Published var input: String = ""
@@ -211,17 +219,6 @@ final class ChatVM: ObservableObject {
                     append(.moderator, "Server error: \( (response as? HTTPURLResponse)?.statusCode ?? 0 )")
                     return
                 }
-                struct APIResponse: Decodable {
-                    let success: Bool
-                    let responses: APIResponses
-                }
-
-                struct APIResponses: Decodable {
-                    let gpt: String
-                    let claude: String
-                    let gemini: String
-                    let moderator: String
-                }
 
                 let decoder = JSONDecoder()
                 let apiResponse = try decoder.decode(APIResponse.self, from: data)
@@ -232,98 +229,8 @@ final class ChatVM: ObservableObject {
                     append(.gemini, apiResponse.responses.gemini)
                     append(.moderator, apiResponse.responses.moderator)
                 }
-                } catch {
-                    append(.moderator, "Error: \(error.localizedDescription)")
-                }
-
-    private func gptReply(to q: String, language: String) -> String {
-        switch language {
-        case "tr":
-            return "Hızlı ve net çerçeve: \(q) sorusunu anlamak için 1) bağlamı tanımla, 2) seçenekleri karşılaştır, 3) tek öneri ver."
-        case "ar":
-            return "إطار سريع وواضح: لفهم \(q)، دعنا 1) نحدد السياق، 2) نقارن الخيارات، 3) ننهي بتوصية واحدة."
-        case "es":
-            return "Marco rápido y claro: Para entender \(q), vamos a 1) definir el contexto, 2) comparar opciones, 3) terminar con una recomendación."
-        case "fr":
-            return "Cadre rapide et clair: Pour comprendre \(q), faisons 1) définir le contexte, 2) comparer les options, 3) finir avec une recommandation."
-        case "de":
-            return "Schneller und klarer Rahmen: Um \(q) zu verstehen, lassen Sie uns 1) den Kontext definieren, 2) Optionen vergleichen, 3) mit einer Empfehlung enden."
-        default:
-            return "Quick and clear framework: To understand \(q), let's 1) define the context, 2) compare options, 3) end with one recommendation."
-        }
-    }
-    
-    private func claudeReply(basedOn text: String, language: String) -> String {
-        switch language {
-        case "tr":
-            return "GPT'nin yaklaşımı mantıklı. Ek olarak risk/maliyet analizi yap; düşük maliyetli denemeyle başla, veriye göre genişlet."
-        case "ar":
-            return "نهج GPT منطقي. بالإضافة إلى ذلك، قم بتحليل المخاطر/التكلفة؛ ابدأ بتجربة منخفضة التكلفة، وتوسع بناءً على البيانات."
-        case "es":
-            return "El enfoque de GPT es lógico. Además, haz análisis de riesgo/costo; empieza con experimento de bajo costo, expande según datos."
-        case "fr":
-            return "L'approche de GPT est logique. En plus, faites une analyse risque/coût; commencez par une expérience à faible coût, développez selon les données."
-        case "de":
-            return "GPTs Ansatz ist logisch. Zusätzlich machen Sie eine Risiko-/Kostenanalyse; beginnen Sie mit einem kostengünstigen Experiment, erweitern Sie basierend auf Daten."
-        default:
-            return "GPT's approach is logical. Additionally, do risk/cost analysis; start with low-cost experiment, expand based on data."
-        }
-    }
-    
-    private func geminiReply(basedOn text: String, language: String) -> String {
-        switch language {
-        case "tr":
-            return "İkisine ek: ölçülebilir metrik belirle (örn. başarı kriteri). 2-4 paragrafı geçme; somut adım ver."
-        case "ar":
-            return "إضافة إلى كليهما: حدد مقاييس قابلة للقياس (مثل معايير النجاح). لا تتجاوز 2-4 فقرات؛ أعط خطوات ملموسة."
-        case "es":
-            return "Agregando a ambos: define métricas medibles (ej. criterios de éxito). No excedas 2-4 párrafos; da pasos concretos."
-        case "fr":
-            return "En ajoutant aux deux: définissez des métriques mesurables (ex. critères de succès). Ne dépassez pas 2-4 paragraphes; donnez des étapes concrètes."
-        case "de":
-            return "Zu beiden hinzufügend: definieren Sie messbare Metriken (z.B. Erfolgskriterien). Überschreiten Sie nicht 2-4 Absätze; geben Sie konkrete Schritte."
-        default:
-            return "Adding to both: define measurable metrics (e.g., success criteria). Keep it under 2-4 paragraphs; give concrete steps."
-        }
-    }
-    
-    private func moderatorSynthesis(from msgs: [ChatMessage], source: ChatMessage.Role, style: ModeratorStyle, language: String) -> String {
-        let last = msgs.suffix(4)
-        let core = last.map { "\($0.role.rawValue): \($0.text)" }.joined(separator: " | ")
-        
-        switch language {
-        case "tr":
-            switch style {
-            case .quickSummary:
-                return "Özet: Ana nokta - küçükten başla, veriye göre genişlet."
-            case .bestAnswer:
-                return "En iyi cevap: GPT'nin çerçevesi + Claude'un risk analizi kombinasyonu en mantıklı yaklaşım."
-            case .actionSteps:
-                return "Adımlar: 1) Bağlamı tanımla, 2) Düşük riskli dene, 3) Sonuçları ölç, 4) Genişlet."
-            case .detailedAnalysis:
-                return "Detaylı analiz: GPT yapısal çerçeve sunuyor, Claude risk yönetimi ekliyor, Gemini ölçülebilirlik vurguluyor. En güçlü yaklaşım: Üçünü birleştirmek - yapısal planla başla, riskleri değerlendir, somut metriklerle ilerle."
-            }
-        case "ar":
-            switch style {
-            case .quickSummary:
-                return "الملخص: النقطة الرئيسية - ابدأ صغيراً، توسع بناءً على البيانات."
-            case .bestAnswer:
-                return "أفضل إجابة: إطار GPT + تحليل مخاطر Claude = أفضل نهج."
-            case .actionSteps:
-                return "الخطوات: 1) حدد السياق، 2) جرب منخفض المخاطر، 3) اقس النتائج، 4) توسع."
-            case .detailedAnalysis:
-                return "التحليل التفصيلي: GPT يقدم إطاراً هيكلياً، Claude يضيف إدارة المخاطر، Gemini يؤكد على القابلية للقياس. أقوى نهج: دمج الثلاثة."
-            }
-        default:
-            switch style {
-            case .quickSummary:
-                return "Summary: Start small, test with data, then scale based on results."
-            case .bestAnswer:
-                return "Best answer: GPT's framework combined with Claude's risk analysis provides the most practical approach."
-            case .actionSteps:
-                return "Action steps: 1) Define context, 2) Test low-risk experiment, 3) Measure results, 4) Scale accordingly."
-            case .detailedAnalysis:
-                return "Detailed analysis: GPT provides structural framework, Claude adds risk management, Gemini emphasizes measurability. Strongest approach: Combine all three - start with structured plan, assess risks, progress with concrete metrics."
+            } catch {
+                append(.moderator, "Error: \(error.localizedDescription)")
             }
         }
     }
@@ -383,7 +290,6 @@ struct ContentView: View {
                         }
                         .padding(.horizontal, 16)
                         .padding(.top, 12)
-                        // Removed zoom/gesture logic
                     }
                     .scrollDismissesKeyboard(.interactively)
                     .background(Color.clear)
@@ -861,92 +767,3 @@ struct SettingsToggleRow: View {
                 .frame(width: 12, height: 12)
                 .scaleEffect(isOn ? 1.0 : 0.8)
                 .animation(.easeInOut(duration: 0.2), value: isOn)
-            
-            Text(title)
-                .fontWeight(.medium)
-            
-            Spacer()
-            
-            Toggle("", isOn: $isOn)
-                .toggleStyle(SwitchToggleStyle(tint: .green))
-        }
-    }
-}
-
-struct ChatBubbleView: View {
-    let message: ChatMessage
-
-    var isUser: Bool { message.role == .user }
-    var name: String { message.role.rawValue }
-    
-    private var bubbleBackground: some View {
-        RoundedRectangle(cornerRadius: 18, style: .continuous)
-            .fill(message.role == .user ? Color(.systemGray5) : Color(.systemBackground).opacity(0.8))
-    }
-    
-    private var roleColor: Color {
-        switch message.role {
-        case .user:
-            return .white
-        case .gpt:
-            return .gray
-        case .claude:
-            return .orange
-        case .gemini:
-            return .purple
-        case .moderator:
-            return .green
-        }
-    }
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 0) {
-            if isUser {
-                Spacer(minLength: 60)
-            }
-            
-            VStack(alignment: isUser ? .trailing : .leading, spacing: 8) {
-                if !isUser {
-                    HStack(spacing: 8) {
-                        Text(name)
-                            .font(.caption)
-                            .fontWeight(.semibold)
-                            .foregroundStyle(roleColor)
-                        Spacer()
-                    }
-                }
-                
-                Text(message.text)
-                    .font(.body)
-                    .multilineTextAlignment(isUser ? .trailing : .leading)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
-                    .background(bubbleBackground)
-                    .clipShape(
-                        RoundedRectangle(
-                            cornerRadius: 18,
-                            style: .continuous
-                        )
-                    )
-                    .foregroundStyle(.primary)
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 18, style: .continuous)
-                            .strokeBorder(
-                                isUser ? .clear : .white.opacity(0.2),
-                                lineWidth: 1
-                            )
-                    )
-                
-                Text(message.date, style: .time)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 4)
-            }
-            
-            if !isUser {
-                Spacer(minLength: 60)
-            }
-        }
-        .padding(.horizontal, 4)
-    }
-}
