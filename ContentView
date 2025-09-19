@@ -1,0 +1,952 @@
+import SwiftUI
+import UIKit
+import NaturalLanguage
+
+// MARK: - Models
+struct ChatMessage: Identifiable, Equatable {
+    enum Role: String {
+        case user = "You"
+        case gpt = "GPT"
+        case claude = "Claude"
+        case gemini = "Gemini"
+        case moderator = "Moderator"
+    }
+    let id = UUID()
+    let role: Role
+    let text: String
+    let date: Date = Date()
+}
+
+struct FeedbackData: Codable {
+    let id: String
+    let feedback: String
+    let timestamp: Date
+    let appVersion: String
+    let deviceInfo: String
+    
+    init(feedback: String) {
+        self.id = UUID().uuidString
+        self.feedback = feedback
+        self.timestamp = Date()
+        self.appVersion = "1.0"
+        self.deviceInfo = UIDevice.current.model
+    }
+}
+
+enum ModeratorStyle: String, CaseIterable {
+    case quickSummary = "Quick Summary"
+    case bestAnswer = "Best Answer"
+    case actionSteps = "Action Steps"
+    case detailedAnalysis = "Detailed Analysis"
+    
+    var turnCost: Int {
+        switch self {
+        case .quickSummary, .bestAnswer, .actionSteps:
+            return 1
+        case .detailedAnalysis:
+            return 2
+        }
+    }
+    
+    var description: String {
+        switch self {
+        case .quickSummary:
+            return "Concise 1-2 sentence summary"
+        case .bestAnswer:
+            return "Identifies the most practical response"
+        case .actionSteps:
+            return "Simple numbered action list"
+        case .detailedAnalysis:
+            return "Comprehensive comparison & recommendation"
+        }
+    }
+}
+
+// MARK: - ViewModel
+struct ChatMessageDTO: Decodable {
+    let role: String
+    let text: String
+}
+
+final class ChatVM: ObservableObject {
+    @Published var messages: [ChatMessage] = []
+    @Published var input: String = ""
+    @Published var isBusy = false
+    
+    // Session tracking
+    private var currentSessionStartIndex: Int = 0
+    
+    // Usage tracking
+    @Published var dailyTurnsUsed: Int = 0
+    let dailyTurnLimit: Int = 150
+    
+    var remainingTurns: Int {
+        return max(0, dailyTurnLimit - dailyTurnsUsed)
+    }
+
+    func clear() {
+        messages.removeAll()
+        currentSessionStartIndex = 0
+    }
+
+    func copyTranscript() {
+        let transcript = messages
+            .map { "[\($0.role.rawValue)]\n\($0.text)" }
+            .joined(separator: "\n\n")
+        UIPasteboard.general.string = transcript
+    }
+    
+    func calculateTurnCost(roundCount: Int, includeGPT: Bool, includeClaude: Bool, includeGemini: Bool, includeModerator: Bool, moderatorStyle: ModeratorStyle) -> Int {
+        let activeAIs = [includeGPT, includeClaude, includeGemini].filter { $0 }.count
+        let aiCost = roundCount * activeAIs
+        let moderatorCost = includeModerator ? moderatorStyle.turnCost : 0
+        return aiCost + moderatorCost
+    }
+    
+    func canSendQuestion(roundCount: Int, includeGPT: Bool, includeClaude: Bool, includeGemini: Bool, includeModerator: Bool, moderatorStyle: ModeratorStyle) -> Bool {
+        let cost = calculateTurnCost(roundCount: roundCount, includeGPT: includeGPT, includeClaude: includeClaude, includeGemini: includeGemini, includeModerator: includeModerator, moderatorStyle: moderatorStyle)
+        return dailyTurnsUsed + cost <= dailyTurnLimit
+    }
+
+    func sendQuestion(includeGPT: Bool, includeClaude: Bool, includeGemini: Bool, includeModerator: Bool, moderatorSource: ChatMessage.Role, moderatorStyle: ModeratorStyle, roundCount: Int) {
+        let q = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty, !isBusy else { return }
+        
+        guard canSendQuestion(roundCount: roundCount, includeGPT: includeGPT, includeClaude: includeClaude, includeGemini: includeGemini, includeModerator: includeModerator, moderatorStyle: moderatorStyle) else {
+            return
+        }
+        
+        let turnCost = calculateTurnCost(roundCount: roundCount, includeGPT: includeGPT, includeClaude: includeClaude, includeGemini: includeGemini, includeModerator: includeModerator, moderatorStyle: moderatorStyle)
+        dailyTurnsUsed += turnCost
+        
+        currentSessionStartIndex = messages.count
+        
+        let detectedLanguage = detectLanguage(from: q)
+        input = ""
+        isBusy = true
+        append(.user, q)
+        let questionID = messages.count - 1
+        fetchOrchestration(
+            question: q,
+            language: detectedLanguage,
+            includeGPT: includeGPT,
+            includeClaude: includeClaude,
+            includeGemini: includeGemini,
+            includeModerator: includeModerator,
+            moderatorSource: moderatorSource,
+            moderatorStyle: moderatorStyle,
+            roundCount: roundCount,
+            questionID: questionID
+        )
+    }
+    
+    func submitFeedback(_ text: String) {
+        let feedback = FeedbackData(feedback: text)
+        saveFeedbackToStorage(feedback)
+    }
+    
+    private func saveFeedbackToStorage(_ feedback: FeedbackData) {
+        var existingFeedbacks: [FeedbackData] = []
+        
+        if let data = UserDefaults.standard.data(forKey: "user_feedbacks"),
+           let decoded = try? JSONDecoder().decode([FeedbackData].self, from: data) {
+            existingFeedbacks = decoded
+        }
+        
+        existingFeedbacks.append(feedback)
+        
+        if let encoded = try? JSONEncoder().encode(existingFeedbacks) {
+            UserDefaults.standard.set(encoded, forKey: "user_feedbacks")
+        }
+    }
+    
+    private func append(_ role: ChatMessage.Role, _ text: String) {
+        messages.append(ChatMessage(role: role, text: text))
+    }
+    
+    private func detectLanguage(from text: String) -> String {
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        return recognizer.dominantLanguage?.rawValue ?? "en"
+    }
+
+    private func fetchOrchestration(
+        question: String,
+        language: String,
+        includeGPT: Bool,
+        includeClaude: Bool,
+        includeGemini: Bool,
+        includeModerator: Bool,
+        moderatorSource: ChatMessage.Role,
+        moderatorStyle: ModeratorStyle,
+        roundCount: Int,
+        questionID: Int
+    ) {
+        Task { @MainActor in
+            defer { isBusy = false }
+            let urlString = "https://ai-agora-backend-production.up.railway.app/api/chat"
+            guard let url = URL(string: urlString) else {
+                append(.moderator, "Error: Invalid backend URL")
+                return
+            }
+            var request = URLRequest(url: url)
+            request.httpMethod = "POST"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            let body: [String: Any] = [
+                "question": question,
+                "language": language,
+                "moderatorStyle": moderatorStyle.rawValue.lowercased(),
+                "conversation": [],
+                "settings": [:]
+            ]
+            do {
+                request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [])
+            } catch {
+                append(.moderator, "Error encoding request: \(error.localizedDescription)")
+                return
+            }
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let httpResp = response as? HTTPURLResponse, httpResp.statusCode == 200 else {
+                    append(.moderator, "Server error: \( (response as? HTTPURLResponse)?.statusCode ?? 0 )")
+                    return
+                }
+                struct APIResponse: Decodable {
+                    let success: Bool
+                    let responses: APIResponses
+                }
+
+                struct APIResponses: Decodable {
+                    let gpt: String
+                    let claude: String
+                    let gemini: String
+                    let moderator: String
+                }
+
+                let decoder = JSONDecoder()
+                let apiResponse = try decoder.decode(APIResponse.self, from: data)
+
+                if apiResponse.success {
+                    append(.gpt, apiResponse.responses.gpt)
+                    append(.claude, apiResponse.responses.claude)
+                    append(.gemini, apiResponse.responses.gemini)
+                    append(.moderator, apiResponse.responses.moderator)
+                }
+                } catch {
+                    append(.moderator, "Error: \(error.localizedDescription)")
+                }
+
+    private func gptReply(to q: String, language: String) -> String {
+        switch language {
+        case "tr":
+            return "Hızlı ve net çerçeve: \(q) sorusunu anlamak için 1) bağlamı tanımla, 2) seçenekleri karşılaştır, 3) tek öneri ver."
+        case "ar":
+            return "إطار سريع وواضح: لفهم \(q)، دعنا 1) نحدد السياق، 2) نقارن الخيارات، 3) ننهي بتوصية واحدة."
+        case "es":
+            return "Marco rápido y claro: Para entender \(q), vamos a 1) definir el contexto, 2) comparar opciones, 3) terminar con una recomendación."
+        case "fr":
+            return "Cadre rapide et clair: Pour comprendre \(q), faisons 1) définir le contexte, 2) comparer les options, 3) finir avec une recommandation."
+        case "de":
+            return "Schneller und klarer Rahmen: Um \(q) zu verstehen, lassen Sie uns 1) den Kontext definieren, 2) Optionen vergleichen, 3) mit einer Empfehlung enden."
+        default:
+            return "Quick and clear framework: To understand \(q), let's 1) define the context, 2) compare options, 3) end with one recommendation."
+        }
+    }
+    
+    private func claudeReply(basedOn text: String, language: String) -> String {
+        switch language {
+        case "tr":
+            return "GPT'nin yaklaşımı mantıklı. Ek olarak risk/maliyet analizi yap; düşük maliyetli denemeyle başla, veriye göre genişlet."
+        case "ar":
+            return "نهج GPT منطقي. بالإضافة إلى ذلك، قم بتحليل المخاطر/التكلفة؛ ابدأ بتجربة منخفضة التكلفة، وتوسع بناءً على البيانات."
+        case "es":
+            return "El enfoque de GPT es lógico. Además, haz análisis de riesgo/costo; empieza con experimento de bajo costo, expande según datos."
+        case "fr":
+            return "L'approche de GPT est logique. En plus, faites une analyse risque/coût; commencez par une expérience à faible coût, développez selon les données."
+        case "de":
+            return "GPTs Ansatz ist logisch. Zusätzlich machen Sie eine Risiko-/Kostenanalyse; beginnen Sie mit einem kostengünstigen Experiment, erweitern Sie basierend auf Daten."
+        default:
+            return "GPT's approach is logical. Additionally, do risk/cost analysis; start with low-cost experiment, expand based on data."
+        }
+    }
+    
+    private func geminiReply(basedOn text: String, language: String) -> String {
+        switch language {
+        case "tr":
+            return "İkisine ek: ölçülebilir metrik belirle (örn. başarı kriteri). 2-4 paragrafı geçme; somut adım ver."
+        case "ar":
+            return "إضافة إلى كليهما: حدد مقاييس قابلة للقياس (مثل معايير النجاح). لا تتجاوز 2-4 فقرات؛ أعط خطوات ملموسة."
+        case "es":
+            return "Agregando a ambos: define métricas medibles (ej. criterios de éxito). No excedas 2-4 párrafos; da pasos concretos."
+        case "fr":
+            return "En ajoutant aux deux: définissez des métriques mesurables (ex. critères de succès). Ne dépassez pas 2-4 paragraphes; donnez des étapes concrètes."
+        case "de":
+            return "Zu beiden hinzufügend: definieren Sie messbare Metriken (z.B. Erfolgskriterien). Überschreiten Sie nicht 2-4 Absätze; geben Sie konkrete Schritte."
+        default:
+            return "Adding to both: define measurable metrics (e.g., success criteria). Keep it under 2-4 paragraphs; give concrete steps."
+        }
+    }
+    
+    private func moderatorSynthesis(from msgs: [ChatMessage], source: ChatMessage.Role, style: ModeratorStyle, language: String) -> String {
+        let last = msgs.suffix(4)
+        let core = last.map { "\($0.role.rawValue): \($0.text)" }.joined(separator: " | ")
+        
+        switch language {
+        case "tr":
+            switch style {
+            case .quickSummary:
+                return "Özet: Ana nokta - küçükten başla, veriye göre genişlet."
+            case .bestAnswer:
+                return "En iyi cevap: GPT'nin çerçevesi + Claude'un risk analizi kombinasyonu en mantıklı yaklaşım."
+            case .actionSteps:
+                return "Adımlar: 1) Bağlamı tanımla, 2) Düşük riskli dene, 3) Sonuçları ölç, 4) Genişlet."
+            case .detailedAnalysis:
+                return "Detaylı analiz: GPT yapısal çerçeve sunuyor, Claude risk yönetimi ekliyor, Gemini ölçülebilirlik vurguluyor. En güçlü yaklaşım: Üçünü birleştirmek - yapısal planla başla, riskleri değerlendir, somut metriklerle ilerle."
+            }
+        case "ar":
+            switch style {
+            case .quickSummary:
+                return "الملخص: النقطة الرئيسية - ابدأ صغيراً، توسع بناءً على البيانات."
+            case .bestAnswer:
+                return "أفضل إجابة: إطار GPT + تحليل مخاطر Claude = أفضل نهج."
+            case .actionSteps:
+                return "الخطوات: 1) حدد السياق، 2) جرب منخفض المخاطر، 3) اقس النتائج، 4) توسع."
+            case .detailedAnalysis:
+                return "التحليل التفصيلي: GPT يقدم إطاراً هيكلياً، Claude يضيف إدارة المخاطر، Gemini يؤكد على القابلية للقياس. أقوى نهج: دمج الثلاثة."
+            }
+        default:
+            switch style {
+            case .quickSummary:
+                return "Summary: Start small, test with data, then scale based on results."
+            case .bestAnswer:
+                return "Best answer: GPT's framework combined with Claude's risk analysis provides the most practical approach."
+            case .actionSteps:
+                return "Action steps: 1) Define context, 2) Test low-risk experiment, 3) Measure results, 4) Scale accordingly."
+            case .detailedAnalysis:
+                return "Detailed analysis: GPT provides structural framework, Claude adds risk management, Gemini emphasizes measurability. Strongest approach: Combine all three - start with structured plan, assess risks, progress with concrete metrics."
+            }
+        }
+    }
+}
+
+// MARK: - Views
+struct ContentView: View {
+    @StateObject private var vm = ChatVM()
+    @State private var lastID = UUID()
+    @State private var showCopied = false
+    @State private var showFeedback = false
+    @State private var showFeedbackSuccess = false
+    @State private var feedbackText = ""
+    @State private var copyDismissTask: DispatchWorkItem?
+
+    @State private var showSettings = false
+    @State private var includeGPT = true
+    @State private var includeClaude = true
+    @State private var includeGemini = true
+    @State private var includeModerator = true
+    @State private var moderatorSource: ChatMessage.Role = .gpt
+    @State private var moderatorStyle: ModeratorStyle = .quickSummary
+    @State private var roundCount = 1
+
+    
+    @FocusState private var isInputActive: Bool
+    @FocusState private var isFeedbackActive: Bool
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                backgroundGradient
+                
+                ScrollViewReader { proxy in
+                    ScrollView(.vertical, showsIndicators: false) {
+                        LazyVStack(alignment: .leading, spacing: 16) {
+                            if vm.messages.isEmpty {
+                                HStack {
+                                    Spacer()
+                                    welcomeView
+                                        .padding(.top, 40)
+                                    Spacer()
+                                }
+                            }
+                            
+                            ForEach(vm.messages) { msg in
+                                ChatBubbleView(message: msg)
+                                    .id(msg.id)
+                                    .transition(.asymmetric(
+                                        insertion: .move(edge: msg.role == .user ? .trailing : .leading)
+                                            .combined(with: .opacity)
+                                            .combined(with: .scale(scale: 0.8)),
+                                        removal: .opacity.combined(with: .scale(scale: 0.8))
+                                    ))
+                            }
+                            Color.clear.frame(height: 1).id(lastID)
+                        }
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                        // Removed zoom/gesture logic
+                    }
+                    .scrollDismissesKeyboard(.interactively)
+                    .background(Color.clear)
+                    .toolbar {
+                        ToolbarItem(placement: .topBarLeading) {
+                            HStack(spacing: 16) {
+                                Text("AI Agora")
+                                    .font(.system(size: 24, weight: .bold))
+                                Button("Idea") {
+                                    showFeedback = true
+                                }
+                            }
+                        }
+                        ToolbarItem(placement: .topBarTrailing) {
+                            HStack(spacing: 16) {
+                                Button("Clear") {
+                                    withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+                                        vm.clear()
+                                    }
+                                }
+                                .disabled(vm.isBusy || vm.messages.isEmpty)
+                                Button("Copy All") {
+                                    copyDismissTask?.cancel()
+                                    vm.copyTranscript()
+                                    showCopied = true
+                                    let task = DispatchWorkItem {
+                                        withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+                                            showCopied = false
+                                        }
+                                    }
+                                    copyDismissTask = task
+                                    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0, execute: task)
+                                }
+                                .disabled(vm.messages.isEmpty)
+                            }
+                        }
+                    }
+                    .onChange(of: vm.messages.last?.id) { _, newValue in
+                        if let id = newValue {
+                            withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+                                proxy.scrollTo(id, anchor: .bottom)
+                            }
+                        }
+                    }
+                    .safeAreaInset(edge: .bottom) {
+                        inputBarView
+                    }
+                    .onChange(of: isInputActive) { _, newValue in
+                        if newValue {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                                withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+                                    proxy.scrollTo(lastID, anchor: .bottom)
+                                }
+                            }
+                        } else if let lastMsg = vm.messages.last {
+                            withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+                                proxy.scrollTo(lastMsg.id, anchor: .bottom)
+                            }
+                        }
+                    }
+                }
+            }
+            .overlay(alignment: .top) {
+                if showCopied {
+                    copiedToast
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                }
+                
+                if showFeedbackSuccess {
+                    feedbackSuccessToast
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                        .onAppear {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                                withAnimation(.spring(response: 0.6, dampingFraction: 0.8)) {
+                                    showFeedbackSuccess = false
+                                }
+                            }
+                        }
+                }
+            }
+        }
+        .tint(.primary)
+        .sheet(isPresented: $showSettings) {
+            settingsView
+        }
+        .sheet(isPresented: $showFeedback) {
+            feedbackView
+        }
+    }
+    
+    private var backgroundGradient: some View {
+        LinearGradient(
+            colors: [
+                Color(.systemGray6),
+                Color(.systemGray5).opacity(0.8),
+                Color(.systemGray6)
+            ],
+            startPoint: .topLeading,
+            endPoint: .bottomTrailing
+        )
+        .ignoresSafeArea()
+    }
+    
+    private var welcomeView: some View {
+        VStack(spacing: 20) {
+            Image(systemName: "brain.head.profile.fill")
+                .font(.system(size: 60))
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [.blue, .purple, .pink],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    )
+                )
+                .symbolEffect(.pulse.byLayer, options: .repeating)
+            
+            VStack(spacing: 12) {
+                Text("Welcome to AI Agora")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                    .multilineTextAlignment(.center)
+                
+                Text("Get different perspectives to make informed decisions - compare three AI responses")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                
+                Button {
+                    showFeedback = true
+                } label: {
+                    Text("Your ideas shape our future updates")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                        .underline()
+                }
+                .padding(.top, 4)
+            }
+            
+            HStack(spacing: 12) {
+                aiIndicator(name: "GPT", color: .gray, isActive: includeGPT)
+                aiIndicator(name: "Claude", color: .orange, isActive: includeClaude)
+                aiIndicator(name: "Gemini", color: .purple, isActive: includeGemini)
+            }
+            .padding(.top, 8)
+        }
+        .padding(24)
+        .background(Color(.systemBackground).opacity(0.9))
+        .clipShape(RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .strokeBorder(
+                    LinearGradient(
+                        colors: [.white.opacity(0.3), .clear],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
+        )
+    }
+    
+    private func aiIndicator(name: String, color: Color, isActive: Bool) -> some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(isActive ? color : .gray.opacity(0.3))
+                .frame(width: 8, height: 8)
+                .scaleEffect(isActive ? 1.0 : 0.7)
+                .animation(.easeInOut(duration: 0.3), value: isActive)
+            
+            Text(name)
+                .font(.caption)
+                .fontWeight(.medium)
+                .foregroundStyle(isActive ? .primary : .secondary)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(Color(.systemBackground).opacity(0.9))
+        .clipShape(Capsule())
+        .opacity(isActive ? 1.0 : 0.6)
+    }
+    
+    private var inputBarView: some View {
+        VStack(spacing: 0) {
+            Rectangle()
+                .fill(Color(.systemBackground).opacity(0.9))
+                .frame(height: 0.5)
+                .opacity(0.6)
+            
+            if !vm.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                HStack {
+                    let turnCost = vm.calculateTurnCost(roundCount: roundCount, includeGPT: includeGPT, includeClaude: includeClaude, includeGemini: includeGemini, includeModerator: includeModerator, moderatorStyle: moderatorStyle)
+                    Text("This question will use: \(turnCost) turns")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                    Text("Remaining: \(vm.remainingTurns)/\(vm.dailyTurnLimit)")
+                        .font(.caption)
+                        .foregroundStyle(vm.remainingTurns < 20 ? .red : .secondary)
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 8)
+            }
+            
+            HStack(spacing: 12) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "slider.horizontal.3")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 44, height: 44)
+                        .background(Color(.systemBackground).opacity(0.9))
+                        .clipShape(Circle())
+                        .overlay(
+                            Circle()
+                                .strokeBorder(.white.opacity(0.2), lineWidth: 1)
+                        )
+                }
+                
+                HStack(spacing: 8) {
+                    TextField("Ask your question...", text: $vm.input, axis: .vertical)
+                        .textFieldStyle(PlainTextFieldStyle())
+                        .lineLimit(1...4)
+                        .disabled(vm.isBusy)
+                        .focused($isInputActive)
+                        .font(.body)
+                    
+                    if !vm.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        Button {
+                            vm.sendQuestion(
+                                includeGPT: includeGPT,
+                                includeClaude: includeClaude,
+                                includeGemini: includeGemini,
+                                includeModerator: includeModerator,
+                                moderatorSource: moderatorSource,
+                                moderatorStyle: moderatorStyle,
+                                roundCount: roundCount
+                            )
+                            isInputActive = false
+                        } label: {
+                            if vm.isBusy {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .tint(.white)
+                            } else {
+                                Image(systemName: "arrow.up")
+                                    .font(.system(size: 16, weight: .semibold))
+                                    .foregroundStyle(.white)
+                            }
+                        }
+                        .frame(width: 32, height: 32)
+                        .background(
+                            vm.isBusy ?
+                            LinearGradient(colors: [.gray], startPoint: .center, endPoint: .center) :
+                            LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
+                        .clipShape(Circle())
+                        .disabled(
+                            vm.input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                            vm.isBusy ||
+                            !vm.canSendQuestion(roundCount: roundCount, includeGPT: includeGPT, includeClaude: includeClaude, includeGemini: includeGemini, includeModerator: includeModerator, moderatorStyle: moderatorStyle)
+                        )
+                        .transition(.scale.combined(with: .opacity))
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 12)
+                .background(Color(.systemBackground).opacity(0.9))
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(.white.opacity(isInputActive ? 0.4 : 0.2), lineWidth: 1)
+                )
+                .animation(.easeInOut(duration: 0.2), value: isInputActive)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 12)
+            .background(Color(.systemBackground).opacity(0.9))
+        }
+    }
+    
+    private var settingsView: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    SettingsToggleRow(title: "GPT", isOn: $includeGPT, color: .gray)
+                    SettingsToggleRow(title: "Claude", isOn: $includeClaude, color: .orange)
+                    SettingsToggleRow(title: "Gemini", isOn: $includeGemini, color: .purple)
+                    SettingsToggleRow(title: "Moderator", isOn: $includeModerator, color: .green)
+                } header: {
+                    Text("AI Assistants")
+                } footer: {
+                    Text("Select which AI assistants will participate in the conversation")
+                }
+                
+                Section {
+                    HStack {
+                        Text("Round Count")
+                        Spacer()
+                        HStack(spacing: 8) {
+                            Text("\(roundCount)")
+                                .fontWeight(.semibold)
+                                .foregroundStyle(.primary)
+                            Stepper("", value: $roundCount, in: 1...3)
+                                .labelsHidden()
+                        }
+                    }
+                    
+                    Picker("Moderator Source", selection: $moderatorSource) {
+                        Label("GPT", systemImage: "brain.head.profile").tag(ChatMessage.Role.gpt)
+                        Label("Claude", systemImage: "sparkles").tag(ChatMessage.Role.claude)
+                        Label("Gemini", systemImage: "diamond").tag(ChatMessage.Role.gemini)
+                    }
+                    
+                    Picker("Moderator Style", selection: $moderatorStyle) {
+                        ForEach(ModeratorStyle.allCases, id: \.self) { style in
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(style.rawValue)
+                                Text(style.description)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .tag(style)
+                        }
+                    }
+                } header: {
+                    Text("Moderator Settings")
+                } footer: {
+                    Text("Which AI will the moderator source from, how many conversation rounds, and what type of summary")
+                }
+            }
+            .navigationTitle("Settings")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") {
+                        showSettings = false
+                    }
+                    .fontWeight(.semibold)
+                }
+            }
+        }
+        .presentationDetents([.fraction(0.8), .large])
+        .presentationDragIndicator(.visible)
+    }
+    
+    private var feedbackView: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Image(systemName: "lightbulb.fill")
+                            .foregroundStyle(.yellow)
+                            .font(.title2)
+                        Text("Got an Idea?")
+                            .font(.title2)
+                            .fontWeight(.semibold)
+                    }
+                    
+                    Text("We're all ears! What feature would make AI Agora even better for you? Any cool ideas, missing features, or things that bug you - we want to hear it all.")
+                        .font(.body)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("What's on your mind?")
+                        .font(.headline)
+                        .fontWeight(.medium)
+                    
+                    TextField("I wish AI Agora could...", text: $feedbackText, axis: .vertical)
+                        .textFieldStyle(PlainTextFieldStyle())
+                        .padding(16)
+                        .background(Color(.systemGray6))
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                        .lineLimit(5...10)
+                        .focused($isFeedbackActive)
+                }
+                
+                Spacer()
+                
+                VStack(spacing: 12) {
+                    Button {
+                        vm.submitFeedback(feedbackText)
+                        feedbackText = ""
+                        showFeedback = false
+                        showFeedbackSuccess = true
+                    } label: {
+                        HStack {
+                            Image(systemName: "heart.fill")
+                            Text("Send My Idea")
+                        }
+                        .font(.body)
+                        .fontWeight(.semibold)
+                        .foregroundStyle(.white)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                        .background(
+                            LinearGradient(colors: [.blue, .purple], startPoint: .topLeading, endPoint: .bottomTrailing)
+                        )
+                        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                    }
+                    .disabled(feedbackText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    
+                    Text("Every great feature started with someone's idea. Yours could be next!")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                }
+            }
+            .padding(24)
+            .navigationTitle("Your Ideas")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Maybe Later") {
+                        showFeedback = false
+                        feedbackText = ""
+                    }
+                }
+            }
+        }
+        .presentationDetents([.fraction(0.7), .large])
+        .presentationDragIndicator(.visible)
+    }
+    
+    private var copiedToast: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Text("Copied")
+                .fontWeight(.medium)
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color(.systemBackground).opacity(0.9))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder(.white.opacity(0.2), lineWidth: 1)
+        )
+        .padding(.top, 8)
+    }
+    
+    private var feedbackSuccessToast: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+            Text("Got it! Thanks for sharing.")
+                .fontWeight(.medium)
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .background(Color(.systemBackground).opacity(0.9))
+        .clipShape(Capsule())
+        .overlay(
+            Capsule()
+                .strokeBorder(.white.opacity(0.2), lineWidth: 1)
+        )
+        .padding(.top, 8)
+    }
+}
+
+struct SettingsToggleRow: View {
+    let title: String
+    @Binding var isOn: Bool
+    let color: Color
+    
+    var body: some View {
+        HStack {
+            Circle()
+                .fill(isOn ? .green : .gray.opacity(0.3))
+                .frame(width: 12, height: 12)
+                .scaleEffect(isOn ? 1.0 : 0.8)
+                .animation(.easeInOut(duration: 0.2), value: isOn)
+            
+            Text(title)
+                .fontWeight(.medium)
+            
+            Spacer()
+            
+            Toggle("", isOn: $isOn)
+                .toggleStyle(SwitchToggleStyle(tint: .green))
+        }
+    }
+}
+
+struct ChatBubbleView: View {
+    let message: ChatMessage
+
+    var isUser: Bool { message.role == .user }
+    var name: String { message.role.rawValue }
+    
+    private var bubbleBackground: some View {
+        RoundedRectangle(cornerRadius: 18, style: .continuous)
+            .fill(message.role == .user ? Color(.systemGray5) : Color(.systemBackground).opacity(0.8))
+    }
+    
+    private var roleColor: Color {
+        switch message.role {
+        case .user:
+            return .white
+        case .gpt:
+            return .gray
+        case .claude:
+            return .orange
+        case .gemini:
+            return .purple
+        case .moderator:
+            return .green
+        }
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 0) {
+            if isUser {
+                Spacer(minLength: 60)
+            }
+            
+            VStack(alignment: isUser ? .trailing : .leading, spacing: 8) {
+                if !isUser {
+                    HStack(spacing: 8) {
+                        Text(name)
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundStyle(roleColor)
+                        Spacer()
+                    }
+                }
+                
+                Text(message.text)
+                    .font(.body)
+                    .multilineTextAlignment(isUser ? .trailing : .leading)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 12)
+                    .background(bubbleBackground)
+                    .clipShape(
+                        RoundedRectangle(
+                            cornerRadius: 18,
+                            style: .continuous
+                        )
+                    )
+                    .foregroundStyle(.primary)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 18, style: .continuous)
+                            .strokeBorder(
+                                isUser ? .clear : .white.opacity(0.2),
+                                lineWidth: 1
+                            )
+                    )
+                
+                Text(message.date, style: .time)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 4)
+            }
+            
+            if !isUser {
+                Spacer(minLength: 60)
+            }
+        }
+        .padding(.horizontal, 4)
+    }
+}
